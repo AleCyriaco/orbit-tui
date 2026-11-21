@@ -113,7 +113,7 @@ Response: `{"ok":true,"data":{…}}` or `{"ok":false,"error":"…","topics":[…
 | `capabilities` | telemetry api version, host version, topic list, **and the list of things the host cannot provide** |
 | `host` | host version, telemetry api version |
 | `summary` | cpu/mem/gpu/disk %, rx/tx kbps, battery, uptime, temp |
-| `cpu` | total %, per-core %, load 1/5/15, freq, per-sensor temps |
+| `cpu` | total %, per-core %, load 1/5/15, freq, per-sensor temps, `sockets` (per physical CPU: `socket`, `temp_c`, `sensors_c`) |
 | `memory` | total/used/swap bytes and percentages |
 | `network` | aggregate rx/tx rate and totals (`aggregate_only: true`) |
 | `disk` | per-mount path, device, used/total bytes, used % |

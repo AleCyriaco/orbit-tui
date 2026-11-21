@@ -578,20 +578,25 @@ pub fn render(f: &mut Frame, area: Rect, theme: &Theme, is_focused: bool, select
 
     if let Some(max) = cpu.max_temp() {
         let limit = if area.width > 35 { 6 } else { 3 };
-        let mut t_str = cpu
-            .temps
+        // Multi-socket: show each package reading, since the raw sensor list
+        // would mix both CPUs and cut off the second one.
+        let (what, temps) = match cpu.socket_temps() {
+            Some(per_socket) => ("cpus", per_socket),
+            None => ("cores", cpu.temps.clone()),
+        };
+        let mut t_str = temps
             .iter()
             .take(limit)
             .map(|t| format!("{:.0}°", t))
             .collect::<Vec<_>>()
             .join(" ");
-        if cpu.temps.len() > limit {
+        if temps.len() > limit {
             t_str.push_str(" …");
         }
         lines.push(build_line(
             i,
             "TEMPS",
-            vec![Span::styled("cores", Style::default().fg(theme.dim))],
+            vec![Span::styled(what, Style::default().fg(theme.dim))],
             vec![Span::styled(t_str, Style::default().fg(theme.temp(max)))],
         ));
     }
