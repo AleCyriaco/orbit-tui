@@ -25,12 +25,32 @@ pub struct CpuSnapshot {
     /// Temperature of the physical core each logical CPU runs on, aligned
     /// with `cores`. `None` when the sensor or topology is unknown.
     pub thread_temps: Vec<Option<f64>>,
+    /// One entry per physical CPU package (socket), sorted by socket id.
+    /// Empty when no CPU hwmon driver is loaded.
+    pub sockets: Vec<SocketTemp>,
+}
+
+/// Temperatures of one physical CPU package.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SocketTemp {
+    /// 0-based socket id (`physical_package_id`).
+    pub socket: u32,
+    /// The package-wide reading (Tdie / Package id N / Tctl).
+    pub package_c: f64,
+    /// Every sensor of this package, sorted by sensor index.
+    pub sensors_c: Vec<f64>,
 }
 
 impl CpuSnapshot {
     /// Hottest sensor, or None when no sensor is available.
     pub fn max_temp(&self) -> Option<f64> {
         self.temps.iter().copied().reduce(f64::max)
+    }
+
+    /// Package temperature per socket, but only on multi-socket machines,
+    /// where a single max would hide which CPU is hot.
+    pub fn socket_temps(&self) -> Option<Vec<f64>> {
+        (self.sockets.len() > 1).then(|| self.sockets.iter().map(|s| s.package_c).collect())
     }
 }
 
@@ -81,7 +101,11 @@ pub fn sample(sys: &sysinfo::System) {
     }
 
     let la = sysinfo::System::load_average();
-    let (temps, by_core) = read_core_temps();
+    let CoreTemps {
+        all: temps,
+        by_core,
+        sockets,
+    } = read_core_temps();
     let thread_temps = sys
         .cpus()
         .iter()
@@ -104,6 +128,7 @@ pub fn sample(sys: &sysinfo::System) {
         freq_mhz: sys.cpus().iter().map(|c| c.frequency()).max().unwrap_or(0),
         temps,
         thread_temps,
+        sockets,
     };
     HISTORY_USAGE.lock().unwrap().push(snap.usage as f64);
     HISTORY_USER.lock().unwrap().push(snap.user_pct as f64);
@@ -112,15 +137,23 @@ pub fn sample(sys: &sysinfo::System) {
     *SNAP.lock().unwrap() = std::sync::Arc::new(snap);
 }
 
-/// Physical core id of each logical CPU (`cpuN/topology/core_id`), read once.
-static THREAD_CORE: LazyLock<Vec<Option<u32>>> = LazyLock::new(|| {
+/// (socket, physical core id) of each logical CPU, from
+/// `cpuN/topology/{physical_package_id,core_id}`, read once. Core ids repeat
+/// on every socket, so both are needed to find a thread's sensor.
+static THREAD_CORE: LazyLock<Vec<Option<(u32, u32)>>> = LazyLock::new(|| {
+    let read = |dir: &str, f: &str| -> Option<u32> {
+        fs::read_to_string(format!("{}/topology/{}", dir, f))
+            .ok()?
+            .trim()
+            .parse()
+            .ok()
+    };
     (0..)
         .map_while(|i| {
             let dir = format!("/sys/devices/system/cpu/cpu{}", i);
             std::path::Path::new(&dir).exists().then(|| {
-                fs::read_to_string(format!("{}/topology/core_id", dir))
-                    .ok()
-                    .and_then(|s| s.trim().parse().ok())
+                let core = read(&dir, "core_id")?;
+                Some((read(&dir, "physical_package_id").unwrap_or(0), core))
             })
         })
         .collect()
@@ -157,59 +190,125 @@ fn core_label_id(label: &str) -> Option<u32> {
     label.trim().strip_prefix("Core ")?.parse().ok()
 }
 
-/// All CPU sensor temps (sorted by sensor index) plus a map from physical
-/// core id to its temperature, taken from the `tempN_label` files.
-fn read_core_temps() -> (Vec<f64>, std::collections::HashMap<u32, f64>) {
-    let mut by_core = std::collections::HashMap::new();
-    let mut temps_out = Vec::new();
+/// "Package id 1" -> 1 (Intel coretemp names its package sensor this way).
+fn package_label_id(label: &str) -> Option<u32> {
+    label.trim().strip_prefix("Package id ")?.parse().ok()
+}
 
-    if let Ok(hwmon_dir) = fs::read_dir("/sys/class/hwmon/") {
-        for hwmon_entry in hwmon_dir.flatten() {
-            let Ok(name) = fs::read_to_string(hwmon_entry.path().join("name")) else {
-                continue;
-            };
-            if !matches!(name.trim(), "coretemp" | "k10temp" | "zenpower") {
-                continue;
-            }
-            if let Ok(temp_dir) = fs::read_dir(hwmon_entry.path()) {
-                for te in temp_dir.flatten() {
-                    let fname = te.file_name().to_string_lossy().to_string();
-                    let Some(num) = fname
-                        .strip_prefix("temp")
-                        .and_then(|s| s.strip_suffix("_input"))
-                        .and_then(|s| s.parse::<usize>().ok())
-                    else {
-                        continue;
-                    };
-                    if let Some(v) = fs::read_to_string(te.path())
-                        .ok()
-                        .and_then(|v| v.trim().parse::<f64>().ok())
-                    {
-                        let c = v / 1000.0;
-                        temps_out.push((num, c));
-                        let label = hwmon_entry.path().join(format!("temp{}_label", num));
-                        if let Some(id) = fs::read_to_string(label)
-                            .ok()
-                            .and_then(|l| core_label_id(&l))
-                        {
-                            by_core.insert(id, c);
-                        }
-                    }
-                }
-            }
-            temps_out.sort_by_key(|(idx, _)| *idx);
-            return (temps_out.into_iter().map(|(_, t)| t).collect(), by_core);
+/// The reading that stands for the whole package: Tdie, then the Intel
+/// package sensor, then Tctl (which some AMD parts offset upwards), else the
+/// first sensor.
+fn package_reading(sensors: &[(String, f64)]) -> Option<f64> {
+    let find = |pred: &dyn Fn(&str) -> bool| {
+        sensors
+            .iter()
+            .find(|(l, _)| pred(l.trim()))
+            .map(|(_, t)| *t)
+    };
+    find(&|l| l == "Tdie")
+        .or_else(|| find(&|l| l.starts_with("Package id ")))
+        .or_else(|| find(&|l| l == "Tctl"))
+        .or_else(|| sensors.first().map(|(_, t)| *t))
+}
+
+/// One CPU hwmon device's sensors, as (label, °C) sorted by sensor index.
+fn read_hwmon_sensors(dir: &std::path::Path) -> Vec<(String, f64)> {
+    let mut sensors: Vec<(usize, String, f64)> = fs::read_dir(dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|te| {
+            let fname = te.file_name().to_string_lossy().to_string();
+            let num = fname
+                .strip_prefix("temp")?
+                .strip_suffix("_input")?
+                .parse::<usize>()
+                .ok()?;
+            let v = fs::read_to_string(te.path())
+                .ok()?
+                .trim()
+                .parse::<f64>()
+                .ok()?;
+            let label = fs::read_to_string(dir.join(format!("temp{}_label", num)))
+                .map(|l| l.trim().to_string())
+                .unwrap_or_default();
+            Some((num, label, v / 1000.0))
+        })
+        .collect();
+    sensors.sort_by_key(|(num, _, _)| *num);
+    sensors.into_iter().map(|(_, l, t)| (l, t)).collect()
+}
+
+/// All CPU sensor temps (socket by socket, each sorted by sensor index), a
+/// map from (socket, physical core id) to its temperature, and one package
+/// reading per socket.
+///
+/// Each CPU package has its own hwmon device (`coretemp.N` on Intel, one
+/// k10temp per data-fabric node on AMD). Sockets are numbered by the Intel
+/// "Package id" label when present, else by the device's sysfs path order,
+/// which follows the node number on AMD.
+fn read_core_temps() -> CoreTemps {
+    let mut out = CoreTemps::default();
+
+    let mut hwmons: Vec<(std::path::PathBuf, std::path::PathBuf)> =
+        fs::read_dir("/sys/class/hwmon/")
+            .into_iter()
+            .flatten()
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| {
+                fs::read_to_string(p.join("name"))
+                    .is_ok_and(|n| matches!(n.trim(), "coretemp" | "k10temp" | "zenpower"))
+            })
+            .map(|p| {
+                (
+                    fs::canonicalize(p.join("device")).unwrap_or_else(|_| p.clone()),
+                    p,
+                )
+            })
+            .collect();
+    hwmons.sort();
+
+    for (idx, (_, dir)) in hwmons.iter().enumerate() {
+        let sensors = read_hwmon_sensors(dir);
+        if sensors.is_empty() {
+            continue;
         }
-    }
-
-    let comps = sysinfo::Components::new_with_refreshed_list();
-    for comp in &comps {
-        if let Some(temp) = comp.temperature() {
-            temps_out.push((temps_out.len(), temp as f64));
+        let socket = sensors
+            .iter()
+            .find_map(|(l, _)| package_label_id(l))
+            .unwrap_or(idx as u32);
+        for (label, t) in &sensors {
+            if let Some(core) = core_label_id(label) {
+                out.by_core.insert((socket, core), *t);
+            }
         }
+        if let Some(package) = package_reading(&sensors) {
+            out.sockets.push(SocketTemp {
+                socket,
+                package_c: package,
+                sensors_c: sensors.iter().map(|(_, t)| *t).collect(),
+            });
+        }
+        out.all.extend(sensors.iter().map(|(_, t)| *t));
     }
+    out.sockets.sort_by_key(|s| s.socket);
 
-    (temps_out.into_iter().map(|(_, c)| c).collect(), by_core)
+    if out.all.is_empty() {
+        let comps = sysinfo::Components::new_with_refreshed_list();
+        out.all = comps
+            .iter()
+            .filter_map(|c| c.temperature().map(f64::from))
+            .collect();
+    }
+    out
+}
+
+#[derive(Default)]
+struct CoreTemps {
+    all: Vec<f64>,
+    by_core: std::collections::HashMap<(u32, u32), f64>,
+    sockets: Vec<SocketTemp>,
 }
 
 /// One row of per-core load: each core gets an equal slice filled with a
@@ -243,6 +342,24 @@ fn render_core_strip(f: &mut Frame, area: Rect, theme: &Theme, cores: &[f32]) {
     f.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
+/// Width of the `c{i}` label column, one cell wider than the longest label.
+fn core_label_width(core_count: usize) -> usize {
+    let digits = core_count.saturating_sub(1).max(1).ilog10() as usize + 1;
+    digits + 2
+}
+
+/// Columns in the per-core meter grid. Starts at two (one when narrow) and
+/// adds columns until every core fits in `max_rows`, as long as each cell
+/// still has room for the label, a short bar and the percentage.
+fn cores_per_line(core_count: usize, width: u16, max_rows: u16, label_w: usize) -> usize {
+    const SPACING: usize = 2;
+    let base = if width >= 36 { 2 } else { 1 };
+    let min_cell = label_w + 3 + 5;
+    let max_cols = ((width as usize + SPACING) / (min_cell + SPACING)).max(1);
+    let needed = core_count.div_ceil((max_rows as usize).max(1));
+    needed.max(base).min(max_cols.max(base))
+}
+
 /// Monitor-page CPU panel: header, big history graph, per-core meters.
 pub fn render(f: &mut Frame, area: Rect, theme: &Theme, is_detailed: bool) {
     if area.height < 3 || area.width < 20 {
@@ -250,16 +367,17 @@ pub fn render(f: &mut Frame, area: Rect, theme: &Theme, is_detailed: bool) {
     }
     let snap = snapshot();
     let core_count = snap.cores.len();
+    let label_w = core_label_width(core_count);
 
-    // Two cores per line when wide enough, otherwise one.
-    let per_line = if area.width >= 36 { 2 } else { 1 };
+    // Cap the core block so the graph always keeps at least 2 rows.
+    let max_rows = area.height.saturating_sub(4);
+    let per_line = cores_per_line(core_count, area.width, max_rows, label_w);
     let mut core_rows = if is_detailed {
         core_count.div_ceil(per_line) as u16
     } else {
         0
     };
-    // Cap the core block so the graph always keeps at least 2 rows.
-    core_rows = core_rows.min(area.height.saturating_sub(4));
+    core_rows = core_rows.min(max_rows);
 
     // Compact mode: a one-row per-core heat strip under the graph.
     let strip = !is_detailed && area.height >= 6 && core_count > 0;
@@ -300,11 +418,23 @@ pub fn render(f: &mut Frame, area: Rect, theme: &Theme, is_detailed: bool) {
 
     // Most to least important, so trimming from the end drops the least
     // useful facts first instead of clipping a number at the border.
-    if let Some(t) = snap.max_temp().filter(|_| is_detailed) {
-        header.push(Span::styled(
-            format!("  {:.0}°C", t),
-            Style::default().fg(theme.temp(t)),
-        ));
+    // Multi-socket: one reading per CPU, numbered from 1 like the physical
+    // sockets on the board ("cpu1 38°C  cpu2 39°C"); otherwise the hottest.
+    let temps: Vec<(String, f64)> = match (is_detailed, snap.socket_temps()) {
+        (false, _) => Vec::new(),
+        (true, Some(per_socket)) => per_socket
+            .iter()
+            .enumerate()
+            .map(|(i, t)| (format!("  cpu{} {:.0}°C", i + 1, t), *t))
+            .collect(),
+        (true, None) => snap
+            .max_temp()
+            .map(|t| (format!("  {:.0}°C", t), t))
+            .into_iter()
+            .collect(),
+    };
+    for (text, t) in temps {
+        header.push(Span::styled(text, Style::default().fg(theme.temp(t))));
     }
     if snap.freq_mhz > 0 && is_detailed {
         header.push(Span::styled(
@@ -360,7 +490,6 @@ pub fn render(f: &mut Frame, area: Rect, theme: &Theme, is_detailed: bool) {
     // Fixed columns so every bar starts and ends at the same x: the temp
     // column is reserved whenever any core has a sensor, and dropped when the
     // cell is too narrow to fit a useful bar alongside it.
-    let label_w = if core_count > 10 { 4 } else { 3 };
     let any_temp = snap.thread_temps.iter().any(Option::is_some);
     let cell_w = cols[0].width as usize;
     let show_temp = any_temp && cell_w >= label_w + 6 + 5 + 4;
@@ -405,5 +534,124 @@ mod tests {
         assert_eq!(core_label_id("Core 3\n"), Some(3));
         assert_eq!(core_label_id("Package id 0"), None);
         assert_eq!(core_label_id("Tctl"), None);
+    }
+
+    fn sensors(list: &[(&str, f64)]) -> Vec<(String, f64)> {
+        list.iter().map(|(l, t)| (l.to_string(), *t)).collect()
+    }
+
+    #[test]
+    fn package_labels_name_the_socket() {
+        assert_eq!(package_label_id("Package id 1\n"), Some(1));
+        assert_eq!(package_label_id("Core 1"), None);
+        assert_eq!(package_label_id("Tctl"), None);
+    }
+
+    #[test]
+    fn package_reading_prefers_die_then_package_then_tctl() {
+        // AMD EPYC k10temp: Tctl plus one sensor per CCD.
+        let amd = sensors(&[("Tctl", 38.6), ("Tccd1", 33.5), ("Tccd3", 34.5)]);
+        assert_eq!(package_reading(&amd), Some(38.6));
+        // Ryzen with an offset Tctl: Tdie is the real die temperature.
+        let tdie = sensors(&[("Tctl", 60.0), ("Tdie", 40.0)]);
+        assert_eq!(package_reading(&tdie), Some(40.0));
+        // Intel coretemp: the package sensor, not the hottest core.
+        let intel = sensors(&[("Package id 0", 45.0), ("Core 0", 50.0)]);
+        assert_eq!(package_reading(&intel), Some(45.0));
+        // Unlabelled sensors fall back to the first one.
+        assert_eq!(
+            package_reading(&sensors(&[("", 30.0), ("", 31.0)])),
+            Some(30.0)
+        );
+        assert_eq!(package_reading(&[]), None);
+    }
+
+    #[test]
+    fn socket_temps_only_split_on_multi_socket_machines() {
+        let socket = |socket, package_c| SocketTemp {
+            socket,
+            package_c,
+            sensors_c: vec![package_c],
+        };
+        let one = CpuSnapshot {
+            sockets: vec![socket(0, 40.0)],
+            ..Default::default()
+        };
+        assert_eq!(one.socket_temps(), None);
+        let two = CpuSnapshot {
+            sockets: vec![socket(0, 38.6), socket(1, 39.4)],
+            ..Default::default()
+        };
+        assert_eq!(two.socket_temps(), Some(vec![38.6, 39.4]));
+    }
+
+    #[test]
+    fn label_width_fits_longest_core_label() {
+        assert_eq!(core_label_width(8), 3); // "c7 "
+        assert_eq!(core_label_width(16), 4); // "c15 "
+        assert_eq!(core_label_width(128), 5); // "c127 "
+    }
+
+    #[test]
+    fn grid_keeps_two_columns_when_cores_fit() {
+        assert_eq!(cores_per_line(16, 80, 20, 4), 2);
+        assert_eq!(cores_per_line(4, 30, 20, 3), 1);
+    }
+
+    #[test]
+    fn grid_widens_so_128_threads_fit() {
+        let label_w = core_label_width(128);
+        // 200x50 zoomed panel: 42 rows free -> 4 columns, 32 rows.
+        let cols = cores_per_line(128, 196, 42, label_w);
+        assert_eq!(cols, 4);
+        assert!(128usize.div_ceil(cols) <= 42);
+        // Width caps the columns: 13-cell minimum + 2 spacing in 100 cols.
+        assert_eq!(cores_per_line(128, 100, 10, label_w), 6);
+    }
+
+    #[test]
+    fn detailed_panel_draws_every_one_of_128_threads() {
+        use ratatui::{backend::TestBackend, Terminal};
+        *SNAP.lock().unwrap() = std::sync::Arc::new(CpuSnapshot {
+            cores: (0..128).map(|i| (i % 100) as f32).collect(),
+            thread_temps: vec![None; 128],
+            temps: vec![38.6, 33.5, 39.4, 32.5],
+            sockets: vec![
+                SocketTemp {
+                    socket: 0,
+                    package_c: 38.6,
+                    sensors_c: vec![38.6, 33.5],
+                },
+                SocketTemp {
+                    socket: 1,
+                    package_c: 39.4,
+                    sensors_c: vec![39.4, 32.5],
+                },
+            ],
+            ..Default::default()
+        });
+        let theme = Theme::dark();
+        let mut term = Terminal::new(TestBackend::new(196, 46)).unwrap();
+        term.draw(|f| render(f, f.area(), &theme, true)).unwrap();
+        let buf = term.backend().buffer();
+        let screen: String = (0..buf.area.height)
+            .map(|y| {
+                (0..buf.area.width)
+                    .map(|x| buf[(x, y)].symbol())
+                    .collect::<String>()
+                    + "\n"
+            })
+            .collect();
+        for i in [0, 63, 64, 127] {
+            assert!(
+                screen.contains(&format!("c{i} ")),
+                "c{i} missing:\n{screen}"
+            );
+        }
+        let header = screen.lines().next().unwrap();
+        assert!(
+            header.contains("cpu1 39°C") && header.contains("cpu2 39°C"),
+            "{header}"
+        );
     }
 }

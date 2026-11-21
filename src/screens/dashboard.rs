@@ -363,7 +363,10 @@ fn render_dashboard_panel(
         "cpu" => {
             let snap = cpu::snapshot();
             let mut cpu_rt = format!("{:.0}%", sum.cpu_pct);
-            if let Some(t) = snap.max_temp() {
+            if let Some(per_socket) = snap.socket_temps() {
+                let temps: Vec<String> = per_socket.iter().map(|t| format!("{:.0}°", t)).collect();
+                cpu_rt.push_str(&format!(" · {}", temps.join("/")));
+            } else if let Some(t) = snap.max_temp() {
                 cpu_rt.push_str(&format!(" · {:.0}°", t));
             }
             if snap.freq_mhz > 0 && area.width >= 40 {

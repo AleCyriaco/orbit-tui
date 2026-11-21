@@ -303,6 +303,11 @@ fn dispatch(topic: &str, args: &Value) -> Option<Value> {
                 "freq_mhz": c.freq_mhz,
                 "temps_c": c.temps,
                 "max_temp_c": c.max_temp(),
+                "sockets": c.sockets.iter().map(|s| json!({
+                    "socket": s.socket,
+                    "temp_c": s.package_c,
+                    "sensors_c": s.sensors_c,
+                })).collect::<Vec<_>>(),
             })
         }
         "memory" => {
